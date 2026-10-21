@@ -1,14 +1,13 @@
 /*
- * QQForegroundPush v4.4 — 自定义横幅（不依赖系统通知）
+ * QQForegroundPush v4.5 — 精准检测聊天列表更新
  *
- * v4.3 发现：发本地通知后 willPresent 不被调用 → delegate 无效
- * QQ 可能覆盖了我们的 delegate，或通知授权未生效。
+ * v4.4 测试横幅能弹，但 badge 不变（QQ 前台不更新 badge）。
+ * v4.5 用 UITableView insertRows 检测，但加严格过滤：
+ * - dataSource 类名必须包含 Chat/Message/Conv/Session/Recent/Bubble
+ * - 8秒限流
+ * - 只弹横幅，不振动不通知
  *
- * v4.4 策略：完全绕过 UNUserNotificationCenter，
- * 检测到新消息时直接用 UIKit 在屏幕顶部画一个横幅，
- * 3秒后自动消失。跟微信横幅一样的效果。
- *
- * 振动精简：只在检测到新消息时震1下
+ * 振动：2=ctor 1=测试横幅 4=检测到聊天插入
  */
 
 #import <Foundation/Foundation.h>
@@ -30,9 +29,15 @@ static void qqfpLog(NSString *msg) {
     NSLog(@"QQFP: %@", msg);
 }
 
-#pragma mark - Custom Banner View
+#pragma mark - Custom Banner
+
+static NSTimeInterval qqp_lastBannerTime = 0;
 
 static void qqp_showBanner(NSString *title, NSString *body) {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - qqp_lastBannerTime < 5.0) return; // 5秒限流
+    qqp_lastBannerTime = now;
+
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *keyWindow = nil;
         for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -43,49 +48,22 @@ static void qqp_showBanner(NSString *title, NSString *body) {
                 }
             }
         }
-        if (!keyWindow) {
-            // fallback
-            keyWindow = [UIApplication sharedApplication].keyWindow;
-        }
+        if (!keyWindow) keyWindow = [UIApplication sharedApplication].keyWindow;
         if (!keyWindow) return;
 
         CGFloat width = [UIScreen mainScreen].bounds.size.width;
         CGFloat bannerHeight = 80;
-        CGFloat topInset = 0;
-        if (@available(iOS 13.0, *)) {
-            topInset = keyWindow.safeAreaInsets.top;
-        }
+        CGFloat topInset = keyWindow.safeAreaInsets.top;
+        if (topInset < 20) topInset = 20;
 
-        // Container view
-        UIView *banner = [[UIView alloc] initWithFrame:CGRectMake(0, -bannerHeight, width, bannerHeight + topInset)];
+        UIView *banner = [[UIView alloc] initWithFrame:CGRectMake(0, -bannerHeight - topInset, width, bannerHeight + topInset)];
         banner.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.92];
-        banner.layer.cornerRadius = 0;
-        banner.clipsToBounds = YES;
-        banner.tag = 9527;
+        banner.tag = 9528;
 
-        // Remove existing banner
-        UIView *old = [keyWindow viewWithTag:9527];
+        UIView *old = [keyWindow viewWithTag:9528];
         if (old) [old removeFromSuperview];
 
-        // App icon label
-        UILabel *titleLabel = [[UILabel alloc] init];
-        titleLabel.text = title ?: @"QQ";
-        titleLabel.font = [UIFont boldSystemFontOfSize:15];
-        titleLabel.textColor = [UIColor whiteColor];
-        titleLabel.textAlignment = NSTextAlignmentLeft;
-
-        UILabel *bodyLabel = [[UILabel alloc] init];
-        bodyLabel.text = body ?: @"新消息";
-        bodyLabel.font = [UIFont systemFontOfSize:14];
-        bodyLabel.textColor = [UIColor colorWithRed:0.8 green:0.8 blue:0.8 alpha:1.0];
-        bodyLabel.numberOfLines = 2;
-        bodyLabel.textAlignment = NSTextAlignmentLeft;
-
-        UIView *contentView = [[UIView alloc] initWithFrame:CGRectMake(16, topInset, width - 32, bannerHeight)];
-        [banner addSubview:contentView];
-
-        // Icon (blue circle with "Q")
-        UIView *iconBg = [[UIView alloc] initWithFrame:CGRectMake(0, 15, 44, 44)];
+        UIView *iconBg = [[UIView alloc] initWithFrame:CGRectMake(16, topInset + 15, 44, 44)];
         iconBg.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:1.0 alpha:1.0];
         iconBg.layer.cornerRadius = 22;
         iconBg.layer.masksToBounds = YES;
@@ -95,28 +73,30 @@ static void qqp_showBanner(NSString *title, NSString *body) {
         iconLabel.textColor = [UIColor whiteColor];
         iconLabel.textAlignment = NSTextAlignmentCenter;
         [iconBg addSubview:iconLabel];
-        [contentView addSubview:iconBg];
+        [banner addSubview:iconBg];
 
-        titleLabel.frame = CGRectMake(54, 12, width - 86, 20);
-        bodyLabel.frame = CGRectMake(54, 34, width - 86, 36);
-        [contentView addSubview:titleLabel];
-        [contentView addSubview:bodyLabel];
+        UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(70, topInset + 12, width - 86, 20)];
+        titleLabel.text = title ?: @"QQ";
+        titleLabel.font = [UIFont boldSystemFontOfSize:15];
+        titleLabel.textColor = [UIColor whiteColor];
+        [banner addSubview:titleLabel];
+
+        UILabel *bodyLabel = [[UILabel alloc] initWithFrame:CGRectMake(70, topInset + 34, width - 86, 36)];
+        bodyLabel.text = body ?: @"新消息";
+        bodyLabel.font = [UIFont systemFontOfSize:14];
+        bodyLabel.textColor = [UIColor colorWithRed:0.8 green:0.8 blue:0.8 alpha:1.0];
+        bodyLabel.numberOfLines = 2;
+        [banner addSubview:bodyLabel];
 
         [keyWindow addSubview:banner];
 
-        // Slide down animation
-        [UIView animateWithDuration:0.35 delay:0
-            options:UIViewAnimationOptionCurveEaseOut
-            animations:^{
+        [UIView animateWithDuration:0.35 animations:^{
             banner.frame = CGRectMake(0, 0, width, bannerHeight + topInset);
-        } completion:nil];
+        }];
 
-        // Auto dismiss after 3 seconds
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
             dispatch_get_main_queue(), ^{
-            [UIView animateWithDuration:0.35 delay:0
-                options:UIViewAnimationOptionCurveEaseIn
-                animations:^{
+            [UIView animateWithDuration:0.35 animations:^{
                 banner.frame = CGRectMake(0, -bannerHeight - topInset, width, bannerHeight + topInset);
             } completion:^(BOOL finished) {
                 [banner removeFromSuperview];
@@ -125,21 +105,65 @@ static void qqp_showBanner(NSString *title, NSString *body) {
     });
 }
 
-#pragma mark - Badge detection with throttle
+#pragma mark - Check if class is chat-related
+
+static BOOL qqp_isChatRelated(NSString *className) {
+    NSString *lower = [className lowercaseString];
+    NSArray *keywords = @[@"chat", @"message", @"conv", @"session", @"recent", @"bubble", @"msg", @"talk"];
+    for (NSString *kw in keywords) {
+        if ([lower containsString:kw]) return YES;
+    }
+    return NO;
+}
+
+#pragma mark - Hook UITableView (filtered + throttled)
+
+%hook UITableView
+
+- (void)insertRowsAtIndexPaths:(NSArray *)indexPaths withRowAnimation:(UITableViewRowAnimation)animation {
+    if ([indexPaths count] > 0) {
+        id ds = [self dataSource];
+        if (ds) {
+            NSString *cn = NSStringFromClass([ds class]);
+            if (qqp_isChatRelated(cn)) {
+                qqfpBuzz(4);
+                qqfpLog([NSString stringWithFormat:@"insertRows on %@ (%lu rows)", cn, (unsigned long)[indexPaths count]]);
+                qqp_showBanner(@"QQ", @"收到新消息");
+            }
+        }
+    }
+    %orig;
+}
+
+- (void)reloadData {
+    // Log chat-related tableView reloads (no banner, just log)
+    id ds = [self dataSource];
+    if (ds) {
+        NSString *cn = NSStringFromClass([ds class]);
+        if (qqp_isChatRelated(cn)) {
+            static NSTimeInterval lastLog = 0;
+            NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+            if (now - lastLog > 10.0) {
+                lastLog = now;
+                qqfpLog([NSString stringWithFormat:@"reloadData on %@", cn]);
+            }
+        }
+    }
+    %orig;
+}
+
+%end
+
+#pragma mark - Badge (still hooked as fallback)
 
 static NSInteger qqp_lastBadge = 0;
-static NSTimeInterval qqp_lastNotifyTime = 0;
 
 %hook UIApplication
 - (void)setApplicationIconBadgeNumber:(NSInteger)badgeNumber {
     if (badgeNumber > qqp_lastBadge && qqp_lastBadge >= 0) {
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        if (now - qqp_lastNotifyTime > 2.0) {
-            qqp_lastNotifyTime = now;
-            NSInteger diff = badgeNumber - qqp_lastBadge;
-            qqfpBuzz(1);
-            qqfpLog([NSString stringWithFormat:@"badge: %ld -> %ld", (long)qqp_lastBadge, (long)badgeNumber]);
-            qqp_showBanner(@"QQ", [NSString stringWithFormat:@"%ld 条新消息", (long)diff]);
+        if (now - qqp_lastBannerTime > 5.0) {
+            qqp_showBanner(@"QQ", [NSString stringWithFormat:@"%ld 条新消息", (long)(badgeNumber - qqp_lastBadge)]);
         }
     }
     qqp_lastBadge = badgeNumber;
@@ -151,12 +175,8 @@ static NSTimeInterval qqp_lastNotifyTime = 0;
 - (void)setBadgeCount:(NSInteger)count withCompletionHandler:(void(^)(NSError *))handler {
     if (count > qqp_lastBadge && qqp_lastBadge >= 0) {
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        if (now - qqp_lastNotifyTime > 2.0) {
-            qqp_lastNotifyTime = now;
-            NSInteger diff = count - qqp_lastBadge;
-            qqfpBuzz(1);
-            qqfpLog([NSString stringWithFormat:@"setBadgeCount: %ld -> %ld", (long)qqp_lastBadge, (long)count]);
-            qqp_showBanner(@"QQ", [NSString stringWithFormat:@"%ld 条新消息", (long)diff]);
+        if (now - qqp_lastBannerTime > 5.0) {
+            qqp_showBanner(@"QQ", [NSString stringWithFormat:@"%ld 条新消息", (long)(count - qqp_lastBadge)]);
         }
     }
     qqp_lastBadge = count;
@@ -166,14 +186,12 @@ static NSTimeInterval qqp_lastNotifyTime = 0;
 
 %ctor {
     qqfpBuzz(2);
-    qqfpLog(@"=== QQForePush v4.4 ctor ===");
+    qqfpLog(@"=== QQForePush v4.5 ctor ===");
+    %init;
 
-    // 启动5秒后自动弹一条测试横幅
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{
         qqfpBuzz(1);
         qqp_showBanner(@"QQ", @"前台推送测试 — 看到这条说明横幅正常");
     });
-
-    %init;
 }
