@@ -1,6 +1,6 @@
 Package: com.minis.qqforepush
 Name: QQ Foreground Push
-Version: 3.0.0
+Version: 3.1.0
 Architecture: iphoneos-arm64
 Description: Force QQ to display push notifications while in foreground, like WeChat
 Maintainer: minis
