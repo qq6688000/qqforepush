@@ -36,53 +36,15 @@ jobs:
 
       - name: Re-sign with correct ident
         run: |
-          # Theos signs with intermediate filename as ident.
-          # Re-sign with ldid using the final filename so ident matches.
           DYLIB=".theos/obj/QQForePush.dylib"
           ldid -S "$DYLIB"
-          
-          # Verify
-          echo "=== CodeDirectory ident ==="
-          otool -l -arch arm64e "$DYLIB" | grep -A5 'CODE_SIGNATURE' || true
+          echo "=== PAC stubs ==="
+          otool -tv -arch arm64e "$DYLIB" | grep -c paciza || echo "0"
+          echo "=== ident ==="
           codesign -dvvv "$DYLIB" 2>&1 || true
 
-      - name: Verify
-        run: |
-          DYLIB=".theos/obj/QQForePush.dylib"
-          echo "=== Architecture ==="
-          lipo -info "$DYLIB"
-          echo "=== PAC stubs (arm64e) ==="
-          otool -tv -arch arm64e "$DYLIB" | grep -c paciza || echo "0"
-          echo "=== Sections ==="
-          otool -l -arch arm64e "$DYLIB" | grep -E 'mod_init|init_offset' | sort -u
-          echo "=== LC_RPATH ==="
-          otool -l -arch arm64e "$DYLIB" | grep -A1 LC_RPATH | grep path || true
-
-      - name: Convert plist to binary
-        run: plutil -convert binary1 QQForePush.plist -o QQForePush_bplist.plist
-
-      - name: Stage and build deb
-        run: |
-          DYLIB=".theos/obj/QQForePush.dylib"
-          STAGE="/tmp/qqfp-stage"
-          rm -rf "$STAGE"
-          mkdir -p "$STAGE/DEBIAN"
-          mkdir -p "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries"
-
-          cp control "$STAGE/DEBIAN/control"
-          echo "" >> "$STAGE/DEBIAN/control"
-          cp postinst "$STAGE/DEBIAN/postinst"
-          chmod 755 "$STAGE/DEBIAN/postinst"
-
-          cp "$DYLIB" "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries/QQForePush.dylib"
-          cp QQForePush_bplist.plist "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries/QQForePush.plist"
-          chmod 755 "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries/QQForePush.dylib"
-
-          dpkg-deb --build --root-owner-group "$STAGE" \
-            "com.minis.qqforepush_4.1.0_iphoneos-arm64.deb"
-
-      - name: Upload deb
+      - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
-          name: qqforepush-deb
-          path: com.minis.qqforepush_4.1.0_iphoneos-arm64.deb
+          name: QQForePush-dylib
+          path: .theos/obj/QQForePush.dylib
