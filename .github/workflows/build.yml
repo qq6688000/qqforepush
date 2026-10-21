@@ -2,7 +2,7 @@ name: Build QQ Foreground Push
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   workflow_dispatch:
 
 jobs:
@@ -12,8 +12,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        run: |
-          brew install dpkg ldid
+        run: brew install dpkg ldid
 
       - name: Install Theos
         run: |
@@ -35,21 +34,32 @@ jobs:
           make clean || true
           make FINALPACKAGE=1
 
+      - name: Re-sign with correct ident
+        run: |
+          # Theos signs with intermediate filename as ident.
+          # Re-sign with ldid using the final filename so ident matches.
+          DYLIB=".theos/obj/QQForePush.dylib"
+          ldid -S "$DYLIB"
+          
+          # Verify
+          echo "=== CodeDirectory ident ==="
+          otool -l -arch arm64e "$DYLIB" | grep -A5 'CODE_SIGNATURE' || true
+          codesign -dvvv "$DYLIB" 2>&1 || true
+
       - name: Verify
         run: |
           DYLIB=".theos/obj/QQForePush.dylib"
           echo "=== Architecture ==="
-          lipo -info "$DYLIB" || file "$DYLIB"
+          lipo -info "$DYLIB"
           echo "=== PAC stubs (arm64e) ==="
           otool -tv -arch arm64e "$DYLIB" | grep -c paciza || echo "0"
-          echo "=== objc_msgSend ==="
-          otool -tv "$DYLIB" | grep -c objc_msgSend || echo "0"
           echo "=== Sections ==="
           otool -l -arch arm64e "$DYLIB" | grep -E 'mod_init|init_offset' | sort -u
+          echo "=== LC_RPATH ==="
+          otool -l -arch arm64e "$DYLIB" | grep -A1 LC_RPATH | grep path
 
       - name: Convert plist to binary
-        run: |
-          plutil -convert binary1 QQForePush.plist -o QQForePush_bplist.plist
+        run: plutil -convert binary1 QQForePush.plist -o QQForePush_bplist.plist
 
       - name: Stage and build deb
         run: |
@@ -69,10 +79,10 @@ jobs:
           chmod 755 "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries/QQForePush.dylib"
 
           dpkg-deb --build --root-owner-group "$STAGE" \
-            "com.minis.qqforepush_3.1.0_iphoneos-arm64.deb"
+            "com.minis.qqforepush_3.3.0_iphoneos-arm64.deb"
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
         with:
           name: qqforepush-deb
-          path: com.minis.qqforepush_3.1.0_iphoneos-arm64.deb
+          path: com.minis.qqforepush_3.3.0_iphoneos-arm64.deb
