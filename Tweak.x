@@ -1,13 +1,10 @@
 /*
- * QQForegroundPush v4.5 — 精准检测聊天列表更新
+ * QQForegroundPush v4.6 — UITableView + UICollectionView + 2秒限流
  *
- * v4.4 测试横幅能弹，但 badge 不变（QQ 前台不更新 badge）。
- * v4.5 用 UITableView insertRows 检测，但加严格过滤：
- * - dataSource 类名必须包含 Chat/Message/Conv/Session/Recent/Bubble
- * - 8秒限流
- * - 只弹横幅，不振动不通知
+ * v4.5 有横幅但延迟4-5秒甚至没有。
+ * 原因：5秒限流太长 + QQ可能用UICollectionView
  *
- * 振动：2=ctor 1=测试横幅 4=检测到聊天插入
+ * v4.6: 同时hook两个View，限流减到2秒
  */
 
 #import <Foundation/Foundation.h>
@@ -29,14 +26,14 @@ static void qqfpLog(NSString *msg) {
     NSLog(@"QQFP: %@", msg);
 }
 
-#pragma mark - Custom Banner
+#pragma mark - Banner
 
-static NSTimeInterval qqp_lastBannerTime = 0;
+static NSTimeInterval qqp_lastBanner = 0;
 
 static void qqp_showBanner(NSString *title, NSString *body) {
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - qqp_lastBannerTime < 5.0) return; // 5秒限流
-    qqp_lastBannerTime = now;
+    if (now - qqp_lastBanner < 2.0) return; // 2秒限流
+    qqp_lastBanner = now;
 
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *keyWindow = nil;
@@ -54,7 +51,7 @@ static void qqp_showBanner(NSString *title, NSString *body) {
         CGFloat width = [UIScreen mainScreen].bounds.size.width;
         CGFloat bannerHeight = 80;
         CGFloat topInset = keyWindow.safeAreaInsets.top;
-        if (topInset < 20) topInset = 20;
+        if (topInset < 20) topInset = 44;
 
         UIView *banner = [[UIView alloc] initWithFrame:CGRectMake(0, -bannerHeight - topInset, width, bannerHeight + topInset)];
         banner.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.92];
@@ -90,13 +87,13 @@ static void qqp_showBanner(NSString *title, NSString *body) {
 
         [keyWindow addSubview:banner];
 
-        [UIView animateWithDuration:0.35 animations:^{
+        [UIView animateWithDuration:0.3 animations:^{
             banner.frame = CGRectMake(0, 0, width, bannerHeight + topInset);
         }];
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
             dispatch_get_main_queue(), ^{
-            [UIView animateWithDuration:0.35 animations:^{
+            [UIView animateWithDuration:0.3 animations:^{
                 banner.frame = CGRectMake(0, -bannerHeight - topInset, width, bannerHeight + topInset);
             } completion:^(BOOL finished) {
                 [banner removeFromSuperview];
@@ -105,18 +102,25 @@ static void qqp_showBanner(NSString *title, NSString *body) {
     });
 }
 
-#pragma mark - Check if class is chat-related
+#pragma mark - Chat-related check
 
-static BOOL qqp_isChatRelated(NSString *className) {
-    NSString *lower = [className lowercaseString];
-    NSArray *keywords = @[@"chat", @"message", @"conv", @"session", @"recent", @"bubble", @"msg", @"talk"];
+static BOOL qqp_isChatRelated(NSString *cn) {
+    if (!cn || cn.length == 0) return NO;
+    NSString *lower = [cn lowercaseString];
+    static NSArray *keywords = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        keywords = @[@"chat", @"message", @"conv", @"session", @"recent",
+                      @"bubble", @"msg", @"talk", @"c2c", @"group",
+                      @"feed", @"timeline", @"notify", @"unread"];
+    });
     for (NSString *kw in keywords) {
         if ([lower containsString:kw]) return YES;
     }
     return NO;
 }
 
-#pragma mark - Hook UITableView (filtered + throttled)
+#pragma mark - UITableView
 
 %hook UITableView
 
@@ -127,7 +131,6 @@ static BOOL qqp_isChatRelated(NSString *className) {
             NSString *cn = NSStringFromClass([ds class]);
             if (qqp_isChatRelated(cn)) {
                 qqfpBuzz(4);
-                qqfpLog([NSString stringWithFormat:@"insertRows on %@ (%lu rows)", cn, (unsigned long)[indexPaths count]]);
                 qqp_showBanner(@"QQ", @"收到新消息");
             }
         }
@@ -135,17 +138,14 @@ static BOOL qqp_isChatRelated(NSString *className) {
     %orig;
 }
 
-- (void)reloadData {
-    // Log chat-related tableView reloads (no banner, just log)
-    id ds = [self dataSource];
-    if (ds) {
-        NSString *cn = NSStringFromClass([ds class]);
-        if (qqp_isChatRelated(cn)) {
-            static NSTimeInterval lastLog = 0;
-            NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-            if (now - lastLog > 10.0) {
-                lastLog = now;
-                qqfpLog([NSString stringWithFormat:@"reloadData on %@", cn]);
+- (void)reloadRowsAtIndexPaths:(NSArray *)indexPaths withRowAnimation:(UITableViewRowAnimation)animation {
+    if ([indexPaths count] > 0) {
+        id ds = [self dataSource];
+        if (ds) {
+            NSString *cn = NSStringFromClass([ds class]);
+            if (qqp_isChatRelated(cn)) {
+                qqfpBuzz(4);
+                qqp_showBanner(@"QQ", @"收到新消息");
             }
         }
     }
@@ -154,17 +154,48 @@ static BOOL qqp_isChatRelated(NSString *className) {
 
 %end
 
-#pragma mark - Badge (still hooked as fallback)
+#pragma mark - UICollectionView
+
+%hook UICollectionView
+
+- (void)insertItemsAtIndexPaths:(NSArray *)indexPaths {
+    if ([indexPaths count] > 0) {
+        id ds = [self dataSource];
+        if (ds) {
+            NSString *cn = NSStringFromClass([ds class]);
+            if (qqp_isChatRelated(cn)) {
+                qqfpBuzz(4);
+                qqp_showBanner(@"QQ", @"收到新消息");
+            }
+        }
+    }
+    %orig;
+}
+
+- (void)reloadItemsAtIndexPaths:(NSArray *)indexPaths {
+    if ([indexPaths count] > 0) {
+        id ds = [self dataSource];
+        if (ds) {
+            NSString *cn = NSStringFromClass([ds class]);
+            if (qqp_isChatRelated(cn)) {
+                qqfpBuzz(4);
+                qqp_showBanner(@"QQ", @"收到新消息");
+            }
+        }
+    }
+    %orig;
+}
+
+%end
+
+#pragma mark - Badge fallback
 
 static NSInteger qqp_lastBadge = 0;
 
 %hook UIApplication
 - (void)setApplicationIconBadgeNumber:(NSInteger)badgeNumber {
     if (badgeNumber > qqp_lastBadge && qqp_lastBadge >= 0) {
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        if (now - qqp_lastBannerTime > 5.0) {
-            qqp_showBanner(@"QQ", [NSString stringWithFormat:@"%ld 条新消息", (long)(badgeNumber - qqp_lastBadge)]);
-        }
+        qqp_showBanner(@"QQ", [NSString stringWithFormat:@"%ld 条新消息", (long)(badgeNumber - qqp_lastBadge)]);
     }
     qqp_lastBadge = badgeNumber;
     %orig;
@@ -174,10 +205,7 @@ static NSInteger qqp_lastBadge = 0;
 %hook UNUserNotificationCenter
 - (void)setBadgeCount:(NSInteger)count withCompletionHandler:(void(^)(NSError *))handler {
     if (count > qqp_lastBadge && qqp_lastBadge >= 0) {
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        if (now - qqp_lastBannerTime > 5.0) {
-            qqp_showBanner(@"QQ", [NSString stringWithFormat:@"%ld 条新消息", (long)(count - qqp_lastBadge)]);
-        }
+        qqp_showBanner(@"QQ", [NSString stringWithFormat:@"%ld 条新消息", (long)(count - qqp_lastBadge)]);
     }
     qqp_lastBadge = count;
     %orig;
@@ -186,7 +214,7 @@ static NSInteger qqp_lastBadge = 0;
 
 %ctor {
     qqfpBuzz(2);
-    qqfpLog(@"=== QQForePush v4.5 ctor ===");
+    qqfpLog(@"=== QQForePush v4.6 ===");
     %init;
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
