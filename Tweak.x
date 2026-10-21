@@ -25,6 +25,10 @@
 #import <UIKit/UIKit.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
+
+// Cast objc_msgSend to avoid ambiguity on macOS Apple clang
+static id (*qqfp_msgSend)(id, SEL, ...) = (id(*)(id, SEL, ...))objc_msgSend;
 
 static void qqfpBuzz(int n) {
     for (int i = 0; i < n; i++) {
@@ -111,10 +115,10 @@ static void qqp_checkAndSwizzleDelegate(void) {
     }
     free(ivs);
     
-    // Try getting delegate via objc property (uses objc_msgSend but macOS clang has PAC stubs)
+    // Try getting delegate via objc property
     SEL delSel = @selector(delegate);
     if (class_getInstanceMethod(cls, delSel)) {
-        id dg = ((id(*)(id,SEL))objc_msgSend)(center, delSel);
+        id dg = qqfp_msgSend(center, delSel);
         if (dg) {
             qqfpLog(@"found delegate via property, swizzling");
             qqp_swizzleDelegate(dg);
@@ -170,9 +174,10 @@ static NSInteger qqp_lastBadge = 0;
         
         Class uncc = objc_getClass("UNUserNotificationCenter");
         if (uncc) {
-            id center = ((id(*)(id,SEL))objc_msgSend)((id)uncc, @selector(currentNotificationCenter));
+            id center = qqfp_msgSend((id)uncc, @selector(currentNotificationCenter));
             if (center) {
-                ((void(*)(id,SEL,id,void(^)(NSError*)))objc_msgSend)(center,
+                void(*addReq)(id,SEL,id,void(^)(NSError*)) = (void(*)(id,SEL,id,void(^)(NSError*)))objc_msgSend;
+                addReq(center,
                     @selector(addNotificationRequest:withCompletionHandler:),
                     req,
                     ^(NSError *error) {
