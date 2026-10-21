@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+JB=/var/jb
+[ -d "$JB" ] || JB=""
+
+DYLIB="$JB/Library/MobileSubstrate/DynamicLibraries/QQForePush.dylib"
+PLIST="$JB/Library/MobileSubstrate/DynamicLibraries/QQForePush.plist"
+TI="$JB/usr/lib/TweakInject"
+
+chmod 755 "$DYLIB" 2>/dev/null || true
+
+if [ -d "$TI" ] && [ -f "$DYLIB" ] && [ ! -e "$TI/QQForePush.dylib" ]; then
+    ln -sf "$DYLIB" "$TI/QQForePush.dylib" 2>/dev/null || true
+    ln -sf "$PLIST" "$TI/QQForePush.plist" 2>/dev/null || true
+fi
+
+killall QQ 2>/dev/null || true
+
+echo "QQ Foreground Push installed. Reopen QQ to activate."
+exit 0
