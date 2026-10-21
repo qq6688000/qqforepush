@@ -1,23 +1,25 @@
 /*
- * QQForegroundPush v4.0 — 主动发本地通知 + 前台横幅强制
- * 
- * 之前的版本只 hook setDelegate:，但 QQ 从不调用它（QQ 走自己的长连接，
- * 不通过系统 UNUserNotificationCenter）。
- * 
- * v4.0 策略：
- * 1. 定时器轮询 UNUserNotificationCenter 的 delegate，主动 swizzle（不等 setDelegate:）
- * 2. Hook UIApplication setApplicationIconBadgeNumber: — QQ 收到新消息时会更新 badge
- * 3. Badge 增加时，主动发一条本地通知 UNNotificationRequest
- * 4. Hook UNUserNotificationCenter addNotificationRequest: — 确保前台显示横幅
- * 5. Hook delegate 的 willPresentNotification: — 强制返回 Banner|Sound
- * 
+ * QQForegroundPush v4.1 — 主动授权 + 主动设 delegate + setBadgeCount hook
+ *
+ * v4.0 发现 QQ 不调用 setApplicationIconBadgeNumber:，
+ * 可能用 iOS16+ 的 UNUserNotificationCenter setBadgeCount:withCompletionHandler:
+ * 也可能 QQ 从未请求通知授权、从未设 delegate。
+ *
+ * v4.1 新增：
+ * A. %ctor 里主动请求通知授权（不等 QQ 调 requestAuthorization）
+ * B. %ctor 里主动设 UNUserNotificationCenter delegate（不等 QQ 调 setDelegate）
+ * C. Hook setBadgeCount:withCompletionHandler: (iOS16+)
+ * D. Hook requestAuthorizationWithOptions: — 诊断 QQ 是否自己请求过
+ *
  * 振动诊断:
- *   5下 = ctor（插件加载）
+ *   5下 = ctor
  *   2下 = setDelegate 被调用
  *   3下 = willPresent 被触发
  *   4下 = registerForRemoteNotifications
- *   6下 = badge 增加（检测到新消息）
+ *   6下 = badge/setBadgeCount 增加
  *   7下 = 正在发送本地通知
+ *   8下 = 主动请求授权
+ *   9下 = 主动设置 delegate
  */
 
 #import <Foundation/Foundation.h>
@@ -27,7 +29,6 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-// Cast objc_msgSend to avoid ambiguity on macOS Apple clang
 static id (*qqfp_msgSend)(id, SEL, ...) = (id(*)(id, SEL, ...))objc_msgSend;
 
 static void qqfpBuzz(int n) {
@@ -49,27 +50,20 @@ static void qqp_forceWillPresent(id self, SEL _cmd,
     UNUserNotificationCenter *center,
     UNNotification *notification,
     void(^completion)(NSUInteger)) {
-
     qqfpBuzz(3);
-    qqfpLog(@"willPresent called — forcing banner");
-
+    qqfpLog(@"willPresent — forcing banner");
     UNNotificationPresentationOptions forceOpts =
         UNNotificationPresentationOptionBanner |
         UNNotificationPresentationOptionList |
         UNNotificationPresentationOptionSound;
-
-    if (completion) {
-        completion(forceOpts);
-    }
+    if (completion) completion(forceOpts);
 }
 
 static void qqp_swizzleDelegate(id delegate) {
     if (!delegate) return;
-    
     Class cls = [delegate class];
     SEL sel = @selector(userNotificationCenter:willPresentNotification:withCompletionHandler:);
     Method m = class_getInstanceMethod(cls, sel);
-    
     if (m) {
         IMP imp = method_getImplementation(m);
         if (imp != (IMP)qqp_forceWillPresent) {
@@ -83,74 +77,96 @@ static void qqp_swizzleDelegate(id delegate) {
     }
 }
 
-#pragma mark - Proactive delegate swizzle via timer
-
-static void qqp_checkAndSwizzleDelegate(void) {
-    Class uncc = objc_getClass("UNUserNotificationCenter");
-    if (!uncc) return;
-    
-    SEL currentSel = @selector(currentNotificationCenter);
-    Method cm = class_getClassMethod(uncc, currentSel);
-    if (!cm) return;
-    
-    IMP curIMP = method_getImplementation(cm);
-    id center = ((id(*)(id,SEL))curIMP)((id)uncc, currentSel);
-    if (!center) return;
-    
-    // Get delegate via ivar (no objc_msgSend)
-    Class cls = object_getClass(center);
-    unsigned int cnt;
-    Ivar *ivs = class_copyIvarList(cls, &cnt);
-    for (unsigned int i = 0; i < cnt; i++) {
-        const char *nm = ivar_getName(ivs[i]);
-        if (nm && (strstr(nm, "delegate") || strstr(nm, "Delegate"))) {
-            id dg = object_getIvar(center, ivs[i]);
-            if (dg) {
-                qqfpLog(@"found delegate via ivar, swizzling");
-                qqp_swizzleDelegate(dg);
-                free(ivs);
-                return;
-            }
-        }
-    }
-    free(ivs);
-    
-    // Try getting delegate via objc property
-    SEL delSel = @selector(delegate);
-    if (class_getInstanceMethod(cls, delSel)) {
-        id dg = qqfp_msgSend(center, delSel);
-        if (dg) {
-            qqfpLog(@"found delegate via property, swizzling");
-            qqp_swizzleDelegate(dg);
-        }
-    }
-}
-
-static dispatch_source_t qqp_timer = NULL;
-
-static void qqp_startTimer(void) {
-    if (qqp_timer) return;
-    
-    qqp_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    dispatch_source_set_timer(qqp_timer, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), 2 * NSEC_PER_SEC, 0);
-    
-    __block int tick = 0;
-    dispatch_source_set_event_handler(qqp_timer, ^{
-        tick++;
-        qqp_checkAndSwizzleDelegate();
-        if (tick >= 15) { // 30 seconds
-            dispatch_cancel(qqp_timer);
-            qqp_timer = NULL;
-        }
-    });
-    
-    dispatch_resume(qqp_timer);
-    qqfpLog(@"timer started to poll delegate");
-}
-
-#pragma mark - Badge detection → post local notification
+#pragma mark - Post local notification
 
 static NSInteger qqp_lastBadge = 0;
+
+static void qqp_postLocalNotification(NSInteger newCount) {
+    qqfpBuzz(7);
+    qqfpLog(@"posting local notification");
+
+    UNMutableNotificationContent *content = [UNMutableNotificationContent new];
+    content.title = @"QQ";
+    content.body = [NSString stringWithFormat:@"%ld 条新消息", (long)newCount];
+    content.sound = [UNNotificationSound defaultSound];
+
+    UNNotificationRequest *req = [UNNotificationRequest
+        requestWithIdentifier:[NSString stringWithFormat:@"qqfp_%f", [[NSDate date] timeIntervalSince1970]]
+        content:content trigger:nil];
+
+    Class uncc = objc_getClass("UNUserNotificationCenter");
+    if (!uncc) return;
+    id center = qqfp_msgSend((id)uncc, @selector(currentNotificationCenter));
+    if (!center) return;
+
+    void(*addReq)(id,SEL,id,void(^)(NSError*)) = (void(*)(id,SEL,id,void(^)(NSError*)))objc_msgSend;
+    addReq(center,
+        @selector(addNotificationRequest:withCompletionHandler:),
+        req,
+        ^(NSError *error) {
+            if (error) qqfpLog([NSString stringWithFormat:@"addNotification error: %@", error]);
+            else qqfpLog(@"local notification posted successfully");
+        });
+}
+
+#pragma mark - Force setup on launch
+
+static void qqp_forceSetupNotifications(void) {
+    Class uncc = objc_getClass("UNUserNotificationCenter");
+    if (!uncc) return;
+
+    id center = qqfp_msgSend((id)uncc, @selector(currentNotificationCenter));
+    if (!center) return;
+
+    // A. Force request authorization
+    qqfpBuzz(8);
+    qqfpLog(@"force requesting notification authorization");
+
+    UNAuthorizationOptions opts =
+        UNAuthorizationOptionBadge |
+        UNAuthorizationOptionSound |
+        UNAuthorizationOptionAlert;
+
+    void(*reqAuth)(id,SEL,NSUInteger,void(^)(BOOL,NSError*)) =
+        (void(*)(id,SEL,NSUInteger,void(^)(BOOL,NSError*)))objc_msgSend;
+    reqAuth(center,
+        @selector(requestAuthorizationWithOptions:completionHandler:),
+        opts,
+        ^(BOOL granted, NSError *error) {
+            qqfpLog([NSString stringWithFormat:@"authorization granted=%d error=%@", granted, error]);
+        });
+
+    // B. Force set delegate — create a minimal delegate class
+    qqfpBuzz(9);
+    qqfpLog(@"force setting delegate");
+
+    // Check if QQ already set a delegate
+    id existing = qqfp_msgSend(center, @selector(delegate));
+    if (existing) {
+        qqfpLog(@"QQ already has a delegate, swizzling it");
+        qqp_swizzleDelegate(existing);
+    } else {
+        // Create our own delegate
+        Class delegateClass = objc_allocateClassPair([NSObject class], "QQFPDelegate", 0);
+        if (delegateClass) {
+            // Add willPresentNotification method
+            class_addMethod(delegateClass,
+                @selector(userNotificationCenter:willPresentNotification:withCompletionHandler:),
+                (IMP)qqp_forceWillPresent, "v@:@@@");
+            objc_registerClassPair(delegateClass);
+        } else {
+            delegateClass = objc_getClass("QQFPDelegate");
+        }
+
+        if (delegateClass) {
+            id dg = [[delegateClass alloc] init];
+            qqfp_msgSend(center, @selector(setDelegate:), dg);
+            qqfpLog(@"set our own delegate");
+        }
+    }
+}
+
+#pragma mark - Hooks
 
 %hook UIApplication
 
@@ -158,37 +174,7 @@ static NSInteger qqp_lastBadge = 0;
     if (badgeNumber > qqp_lastBadge && qqp_lastBadge >= 0) {
         qqfpBuzz(6);
         qqfpLog([NSString stringWithFormat:@"badge increased: %ld -> %ld", (long)qqp_lastBadge, (long)badgeNumber]);
-        
-        // Post a local notification
-        UNMutableNotificationContent *content = [UNMutableNotificationContent new];
-        content.title = @"QQ";
-        content.body = [NSString stringWithFormat:@"%ld 条新消息", (long)(badgeNumber - qqp_lastBadge)];
-        content.sound = [UNNotificationSound defaultSound];
-        
-        UNNotificationRequest *req = [UNNotificationRequest
-            requestWithIdentifier:[NSString stringWithFormat:@"qqfp_%f", [[NSDate date] timeIntervalSince1970]]
-            content:content
-            trigger:nil];
-        
-        qqfpBuzz(7);
-        
-        Class uncc = objc_getClass("UNUserNotificationCenter");
-        if (uncc) {
-            id center = qqfp_msgSend((id)uncc, @selector(currentNotificationCenter));
-            if (center) {
-                void(*addReq)(id,SEL,id,void(^)(NSError*)) = (void(*)(id,SEL,id,void(^)(NSError*)))objc_msgSend;
-                addReq(center,
-                    @selector(addNotificationRequest:withCompletionHandler:),
-                    req,
-                    ^(NSError *error) {
-                        if (error) {
-                            qqfpLog([NSString stringWithFormat:@"addNotification error: %@", error]);
-                        } else {
-                            qqfpLog(@"local notification posted");
-                        }
-                    });
-            }
-        }
+        qqp_postLocalNotification(badgeNumber - qqp_lastBadge);
     }
     qqp_lastBadge = badgeNumber;
     %orig;
@@ -202,8 +188,6 @@ static NSInteger qqp_lastBadge = 0;
 
 %end
 
-#pragma mark - UNUserNotificationCenter hooks
-
 %hook UNUserNotificationCenter
 
 - (void)setDelegate:(id)delegate {
@@ -215,19 +199,30 @@ static NSInteger qqp_lastBadge = 0;
 
 - (id)delegate {
     id dg = %orig;
-    if (dg) {
-        qqp_swizzleDelegate(dg);
-    }
+    if (dg) qqp_swizzleDelegate(dg);
     return dg;
 }
 
 - (void)addNotificationRequest:(UNNotificationRequest *)request withCompletionHandler:(void(^)(NSError *))handler {
     qqfpBuzz(7);
     qqfpLog([NSString stringWithFormat:@"addNotificationRequest: %@", request.identifier]);
-    
-    // Ensure delegate is swizzled before notification is added
-    qqp_checkAndSwizzleDelegate();
-    
+    qqp_swizzleDelegate(qqfp_msgSend(self, @selector(delegate)));
+    %orig;
+}
+
+- (void)setBadgeCount:(NSInteger)count withCompletionHandler:(void(^)(NSError *))handler {
+    if (count > qqp_lastBadge && qqp_lastBadge >= 0) {
+        qqfpBuzz(6);
+        qqfpLog([NSString stringWithFormat:@"setBadgeCount increased: %ld -> %ld", (long)qqp_lastBadge, (long)count]);
+        qqp_postLocalNotification(count - qqp_lastBadge);
+    }
+    qqp_lastBadge = count;
+    %orig;
+}
+
+- (void)requestAuthorizationWithOptions:(NSUInteger)options completionHandler:(void(^)(BOOL,NSError *))handler {
+    qqfpBuzz(8);
+    qqfpLog(@"QQ requesting notification authorization");
     %orig;
 }
 
@@ -235,12 +230,12 @@ static NSInteger qqp_lastBadge = 0;
 
 %ctor {
     qqfpBuzz(5);
-    qqfpLog(@"=== QQForePush v4.0 ctor ===");
+    qqfpLog(@"=== QQForePush v4.1 ctor ===");
     %init;
-    
-    // Proactively check and swizzle delegate
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        qqp_checkAndSwizzleDelegate();
-        qqp_startTimer();
+
+    // Force setup after 2 seconds (let QQ finish launching)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+        qqp_forceSetupNotifications();
     });
 }
