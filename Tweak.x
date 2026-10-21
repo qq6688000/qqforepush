@@ -84,7 +84,7 @@ static void qqp_forceWillPresent(id self, SEL _cmd,
     %orig;
 }
 
-@end
+%end
 
 %hook UIApplication
 
@@ -100,7 +100,7 @@ static void qqp_forceWillPresent(id self, SEL _cmd,
     %orig;
 }
 
-@end
+%end
 
 %ctor {
     qqfpBuzz(5);
