@@ -17,7 +17,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-static id (*qqfp_msgSend)(id, SEL, ...) = (id(*)(id, SEL, ...))objc_msgSend __attribute__((unused));
+__attribute__((unused)) static id (*qqfp_msgSend)(id, SEL, ...) = (id(*)(id, SEL, ...))objc_msgSend;
 
 static void qqfpBuzz(int n) {
     for (int i = 0; i < n; i++) {
