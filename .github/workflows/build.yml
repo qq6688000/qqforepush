@@ -11,8 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dpkg
-        run: brew install dpkg
+      - name: Install dependencies
+        run: |
+          brew install dpkg ldid
 
       - name: Install Theos
         run: |
