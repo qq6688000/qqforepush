@@ -1,16 +1,14 @@
 /*
- * QQForegroundPush v4.2 — 纯 dylib 版
+ * QQForegroundPush v4.3 — 去掉全局 hook，改为精准检测
  *
- * v4.1 有震8/9（授权+设delegate成功）但没横幅。
- * v4.2 新增：
- * A. Hook NSNotificationCenter postNotificationName: — 检测 QQ 内部消息通知
- * B. Hook UITableView insertRowsAtIndexPaths: — 检测消息列表更新
- * C. Hook setBadgeCount: (iOS16+)
- * D. 授权后直接发本地通知测试
+ * v4.2 hook 了 NSNotificationCenter 和 UITableView 全局方法导致风暴卡死。
+ * v4.3 只保留 badge 检测 + 一次性本地通知测试。
+ *
+ * 核心思路转变：先确认本地通知能不能弹横幅，再考虑怎么检测新消息。
  *
  * 振动：
  *   5=ctor 6=badge 7=发通知 3=willPresent 8=授权 9=设delegate
- *  10=NC内部通知 11=TableView插入 12=setBadgeCount
+ *  13=启动5秒后自动发一条测试通知（确认横幅能不能弹）
  */
 
 #import <Foundation/Foundation.h>
@@ -131,15 +129,20 @@ static void qqp_forceSetup(void) {
     }
 }
 
-#pragma mark - Badge
+#pragma mark - Badge (限流)
 
 static NSInteger qqp_lastBadge = 0;
+static NSTimeInterval qqp_lastNotifyTime = 0;
 
 %hook UIApplication
 - (void)setApplicationIconBadgeNumber:(NSInteger)badgeNumber {
     if (badgeNumber > qqp_lastBadge && qqp_lastBadge >= 0) {
-        qqfpBuzz(6);
-        qqp_postLocalNotification([NSString stringWithFormat:@"%ld 条新消息", (long)(badgeNumber - qqp_lastBadge)]);
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (now - qqp_lastNotifyTime > 3.0) {  // 3秒限流
+            qqp_lastNotifyTime = now;
+            qqfpBuzz(6);
+            qqp_postLocalNotification([NSString stringWithFormat:@"%ld 条新消息", (long)(badgeNumber - qqp_lastBadge)]);
+        }
     }
     qqp_lastBadge = badgeNumber;
     %orig;
@@ -153,8 +156,12 @@ static NSInteger qqp_lastBadge = 0;
 }
 - (void)setBadgeCount:(NSInteger)count withCompletionHandler:(void(^)(NSError *))handler {
     if (count > qqp_lastBadge && qqp_lastBadge >= 0) {
-        qqfpBuzz(12);
-        qqp_postLocalNotification([NSString stringWithFormat:@"%ld 条新消息", (long)(count - qqp_lastBadge)]);
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (now - qqp_lastNotifyTime > 3.0) {
+            qqp_lastNotifyTime = now;
+            qqfpBuzz(12);
+            qqp_postLocalNotification([NSString stringWithFormat:@"%ld 条新消息", (long)(count - qqp_lastBadge)]);
+        }
     }
     qqp_lastBadge = count;
     %orig;
@@ -166,47 +173,20 @@ static NSInteger qqp_lastBadge = 0;
 }
 %end
 
-#pragma mark - Hook NSNotificationCenter
-
-%hook NSNotificationCenter
-- (void)postNotificationName:(NSString *)name object:(id)object userInfo:(NSDictionary *)userInfo {
-    NSString *nl = [name lowercaseString];
-    if ([nl containsString:@"message"] || [nl containsString:@"unread"] ||
-        [nl containsString:@"newmsg"] || [nl containsString:@"msg"] ||
-        [nl containsString:@"chat"] || [nl containsString:@"conv"]) {
-        qqfpBuzz(10);
-        qqfpLog([NSString stringWithFormat:@"NC: %@ userInfo: %@", name, userInfo]);
-        qqp_postLocalNotification([NSString stringWithFormat:@"QQ: %@", name]);
-    }
-    %orig;
-}
-%end
-
-#pragma mark - Hook UITableView
-
-%hook UITableView
-- (void)insertRowsAtIndexPaths:(NSArray *)indexPaths withRowAnimation:(UITableViewRowAnimation)animation {
-    if ([indexPaths count] > 0) {
-        qqfpBuzz(11);
-        id ds = qqfp_msgSend(self, @selector(dataSource));
-        if (ds) {
-            NSString *dsc = NSStringFromClass([ds class]);
-            if ([dsc containsString:@"Message"] || [dsc containsString:@"Chat"] ||
-                [dsc containsString:@"Conv"] || [dsc containsString:@"Recent"]) {
-                qqp_postLocalNotification(@"收到新消息");
-            }
-        }
-    }
-    %orig;
-}
-%end
-
 %ctor {
     qqfpBuzz(5);
-    qqfpLog(@"=== QQForePush v4.2 ctor ===");
+    qqfpLog(@"=== QQForePush v4.3 ctor ===");
     %init;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{
         qqp_forceSetup();
+
+        // 5秒后自动发一条测试通知，确认横幅能不能弹
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{
+            qqfpBuzz(13);
+            qqfpLog(@"=== sending test notification ===");
+            qqp_postLocalNotification(@"QQ前台推送测试 — 看到这条说明横幅正常");
+        });
     });
 }
